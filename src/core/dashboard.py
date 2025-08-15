@@ -11,6 +11,10 @@ from src.core.type_detector import TypeDetector
 from src.core.format_parser import FormatParser
 from src.core.excel_processor import ExcelProcessor
 from src.core.data_storage import DataStorage
+from subsets.run_benchmarking import*
+import time
+
+
 
 # Page configuration
 st.set_page_config(
@@ -33,7 +37,7 @@ st.sidebar.markdown("---")
 # Navigation
 page = st.sidebar.selectbox(
     "Select Page",
-    ["🏠 Home", "📤 Upload & Process", "🔍 Type Detection", "🔧 Data Parsing", "💾 Data Storage", "📈 Data Analysis","🧪 Performance"]
+    ["🏠 Home", "📤 Upload & Process", "🔍 Type Detection", "🔧 Data Parsing", "💾 Data Storage", "📈 Data Analysis","🧪 Performance","💰 Subset Sum"]
 )
 
 # Main content
@@ -658,6 +662,397 @@ elif page == "🧪 Performance":
                 if 'output' in locals():
                     with st.expander("📄 View Partial Benchmark Output"):
                         st.text(output)
+
+
+elif page == "💰 Subset Sum":
+    st.title("💰 Subset Sum Benchmarking")
+    
+    st.markdown("""
+    Compare different subset sum algorithms for matching transactions from one dataset 
+    to target amounts in another dataset.
+    """)
+
+    # Ensure processed_files exists in session state
+    if "processed_files" not in st.session_state:
+        st.session_state.processed_files = {}
+
+    if not st.session_state.processed_files:
+        st.warning("⚠️ No files processed yet. Please upload files first.")
+    else:
+        # Select datasets
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("### 🎯 Target Dataset")
+            target_file = st.selectbox(
+                "Select dataset with target amounts",
+                list(st.session_state.processed_files.keys()),
+                key="target_dataset"
+            )
+            target_df = st.session_state.processed_files[target_file].copy()
+            
+        with col2:
+            st.markdown("### 💰 Transaction Dataset")
+            transaction_file = st.selectbox(
+                "Select dataset with transactions",
+                list(st.session_state.processed_files.keys()),
+                key="transaction_dataset"
+            )
+            transaction_df = st.session_state.processed_files[transaction_file].copy()
+
+        # -------------------------------
+        # Clean column names
+        # -------------------------------
+        transaction_df.columns = transaction_df.columns.map(lambda x: str(x).strip())
+        target_df.columns = target_df.columns.map(lambda x: str(x).strip())
+        transaction_df.columns = transaction_df.columns.str.replace('.', '_', regex=False)
+        target_df.columns = target_df.columns.str.replace('.', '_', regex=False)
+
+        # -------------------------------
+        # Amount Column Selection (ONLY)
+        # -------------------------------
+        st.markdown("### 🔍 Amount Column Selection")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("**Transaction Amount Column**")
+            trans_amount_col = st.selectbox(
+                "Select the amount column from transactions",
+                transaction_df.columns,
+                index=next((i for i, col in enumerate(transaction_df.columns) 
+                          if 'amount' in col.lower()), 0),
+                key="trans_amount_col"
+            )
+            
+        with col2:
+            st.markdown("**Target Amount Column**")
+            target_amount_col = st.selectbox(
+                "Select the amount column from targets",
+                target_df.columns,
+                index=next((i for i, col in enumerate(target_df.columns) 
+                          if 'amount' in col.lower()), 0),
+                key="target_amount_col"
+            )
+
+        # -------------------------------
+        # Data Processing and ID Assignment
+        # -------------------------------
+        st.markdown("### 🔧 Data Processing")
+        
+        if st.button("📋 Process Data & Preview"):
+            try:
+                # Extract only the selected amount columns
+                transaction_amounts = transaction_df[trans_amount_col].copy()
+                target_amounts = target_df[target_amount_col].copy()
+                
+                # Parse and clean amount data
+                parser = FormatParser()
+                
+                # Clean transaction amounts
+                transaction_amounts = transaction_amounts.apply(
+                    lambda x: parser.parse_amount(x) if pd.notna(x) else None
+                )
+                transaction_amounts = pd.to_numeric(transaction_amounts, errors='coerce')
+                
+                # Clean target amounts  
+                target_amounts = target_amounts.apply(
+                    lambda x: parser.parse_amount(x) if pd.notna(x) else None
+                )
+                target_amounts = pd.to_numeric(target_amounts, errors='coerce')
+                
+                # Remove null values and get valid indices
+                valid_trans_mask = transaction_amounts.notna()
+                valid_target_mask = target_amounts.notna()
+                
+                clean_transaction_amounts = transaction_amounts[valid_trans_mask]
+                clean_target_amounts = target_amounts[valid_target_mask]
+                
+                # Assign unique IDs to valid amounts
+                transaction_ids = [f"TX_{i+1:04d}" for i in range(len(clean_transaction_amounts))]
+                target_ids = [f"TG_{i+1:04d}" for i in range(len(clean_target_amounts))]
+                
+                # Create processed dataframes with unique IDs
+                processed_transactions = pd.DataFrame({
+                    'Transaction_ID': transaction_ids,
+                    'amount': clean_transaction_amounts.values,
+                    'original_index': clean_transaction_amounts.index
+                })
+                
+                processed_targets = pd.DataFrame({
+                    'Target_ID': target_ids, 
+                    'amount': clean_target_amounts.values,
+                    'original_index': clean_target_amounts.index
+                })
+                
+                # Store in session state for benchmarking
+                st.session_state.processed_transactions = processed_transactions
+                st.session_state.processed_targets = processed_targets
+                
+                # Display preview
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.markdown("**Processed Transaction Data:**")
+                    st.dataframe(processed_transactions.head(10), use_container_width=True)
+                    st.info(f"✅ {len(processed_transactions)} valid transactions processed")
+                    
+                with col2:
+                    st.markdown("**Processed Target Data:**")
+                    st.dataframe(processed_targets.head(10), use_container_width=True) 
+                    st.info(f"✅ {len(processed_targets)} valid targets processed")
+                
+                # Show data statistics
+                st.markdown("### 📊 Data Statistics")
+                col1, col2, col3, col4 = st.columns(4)
+                
+                with col1:
+                    st.metric("Transaction Range", 
+                             f"{clean_transaction_amounts.min():.2f} - {clean_transaction_amounts.max():.2f}")
+                with col2:
+                    st.metric("Target Range",
+                             f"{clean_target_amounts.min():.2f} - {clean_target_amounts.max():.2f}")
+                with col3:
+                    st.metric("Avg Transaction", f"{clean_transaction_amounts.mean():.2f}")
+                with col4:
+                    st.metric("Avg Target", f"{clean_target_amounts.mean():.2f}")
+                    
+            except Exception as e:
+                st.error(f"Error processing data: {str(e)}")
+                st.code(traceback.format_exc())
+        
+        # -------------------------------
+        # Benchmark Settings (only show if data is processed)
+        # -------------------------------
+        if 'processed_transactions' in st.session_state and 'processed_targets' in st.session_state:
+            st.markdown("### ⚙️ Benchmark Settings")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown("**Target Data Selection**")
+                max_targets = len(st.session_state.processed_targets)
+                target_sample_size = st.number_input(
+                    "Number of targets to test (0 for all)",
+                    min_value=0,
+                    max_value=min(50, max_targets),  # Limit for performance
+                    value=min(10, max_targets),
+                    help="Number of targets to use for benchmarking (smaller = faster)",
+                    key="target_sample_size"
+                )
+            
+            with col2:
+                st.markdown("**Transaction Data Selection**")
+                max_transactions = len(st.session_state.processed_transactions)
+                transaction_sample_size = st.number_input(
+                    "Number of transactions to use (0 for all)",
+                    min_value=0,
+                    max_value=min(1000, max_transactions),  # Limit for performance
+                    value=min(100, max_transactions),
+                    help="Number of transactions to use for matching (smaller = faster)",
+                    key="transaction_sample_size"
+                )
+            
+            if st.button("🏃‍♂️ Run Benchmark"):
+                try:
+                    # Get processed data
+                    trans_data = st.session_state.processed_transactions.copy()
+                    target_data = st.session_state.processed_targets.copy()
+                    
+                    # Sample transactions if requested
+                    if transaction_sample_size > 0 and transaction_sample_size < len(trans_data):
+                        trans_data = trans_data.sample(transaction_sample_size).copy().reset_index(drop=True)
+                        st.info(f"🔄 Using {len(trans_data)} sampled transactions out of {len(st.session_state.processed_transactions)} total")
+                    
+                    # Sample targets if requested
+                    if target_sample_size > 0 and target_sample_size < len(target_data):
+                        target_data = target_data.sample(target_sample_size).copy().reset_index(drop=True)
+                        st.info(f"🎯 Testing {len(target_data)} sampled targets out of {len(st.session_state.processed_targets)} total")
+                    
+                    # Display final data selection summary
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.metric("Selected Transactions", len(trans_data))
+                        st.write(f"Amount range: {trans_data['amount'].min():.2f} - {trans_data['amount'].max():.2f}")
+                    with col2:
+                        st.metric("Selected Targets", len(target_data))
+                        st.write(f"Amount range: {target_data['amount'].min():.2f} - {target_data['amount'].max():.2f}")
+                    
+                    # Rename columns to match backend expectations
+                    trans_data = trans_data.rename(columns={'Transaction_ID': 'Transaction ID'})
+                    target_data = target_data.rename(columns={'Target_ID': 'Target ID'})
+                    
+                    with st.spinner("Running benchmark..."):
+                        st.info(f"🔄 Running benchmark with {len(trans_data)} transactions and {len(target_data)} targets...")
+                        
+                        # Run benchmark
+                        benchmark_results = benchmark_methods(trans_data, target_data)
+                        
+                        # Display results
+                        st.markdown("### 📊 Benchmark Results")
+                        
+                        col1, col2, col3, col4 = st.columns(4)
+                        with col1:
+                            st.metric("Transactions Used", len(trans_data))
+                        with col2:
+                            st.metric("Targets Processed", len(target_data))
+                        with col3:
+                            if len(trans_data) < len(st.session_state.processed_transactions):
+                                st.metric("Transaction Sample %", f"{len(trans_data)/len(st.session_state.processed_transactions)*100:.1f}%")
+                            else:
+                                st.metric("Transaction Sample %", "100%")
+                        with col4:
+                            if len(target_data) < len(st.session_state.processed_targets):
+                                st.metric("Target Sample %", f"{len(target_data)/len(st.session_state.processed_targets)*100:.1f}%")
+                            else:
+                                st.metric("Target Sample %", "100%")
+                        
+                        st.dataframe(benchmark_results, use_container_width=True)
+                        
+                        # -------------------------------
+                        # Visualizations
+                        # -------------------------------
+                        if not benchmark_results.empty:
+                            st.markdown("### 📈 Performance Comparison")
+                            
+                            # Filter valid results for plotting
+                            valid_results = benchmark_results[
+                                (benchmark_results['Time (ms)'] != 'Error') & 
+                                (benchmark_results['Time (ms)'] != float('inf'))
+                            ].copy()
+                            
+                            if not valid_results.empty:
+                                valid_results['Time (ms)'] = pd.to_numeric(valid_results['Time (ms)'], errors='coerce')
+                                
+                                col1, col2 = st.columns(2)
+                                with col1:
+                                    fig_time = px.bar(
+                                        valid_results,
+                                        x='Method',
+                                        y='Time (ms)',
+                                        color='Method',
+                                        title="Execution Time"
+                                    )
+                                    st.plotly_chart(fig_time, use_container_width=True)
+                                
+                                with col2:
+                                    fig_mem = px.bar(
+                                        valid_results,
+                                        x='Method',
+                                        y='Memory (KB)',
+                                        color='Method',
+                                        title="Memory Usage"
+                                    )
+                                    st.plotly_chart(fig_mem, use_container_width=True)
+                        
+                        # -------------------------------
+                        # Show detailed matches with unique IDs
+                        # -------------------------------
+                        st.markdown("### 🔍 Match Details with Unique IDs")
+                        
+                        detailed_matches = []
+                        
+                        # Test first few targets for detailed matching
+                        for _, target_row in target_data.head(5).iterrows():
+                            try:
+                                target_amount = target_row['amount']
+                                target_id = target_row['Target ID']
+                                
+                                # Create transaction tuples for subset_sum_exists
+                                transaction_tuples = list(zip(
+                                    trans_data['amount'].tolist(),
+                                    trans_data['Transaction ID'].tolist()
+                                ))
+                                
+                                # Try to find subset sum match
+                                result = subset_sum_exists(
+                                    transaction_tuples,
+                                    (float(target_amount), target_id),
+                                    precision=100
+                                )
+                                
+                                if result and len(result) > 0 and result[0]:  # Match found
+                                    matching_transaction_ids = result[2] if len(result) > 2 else []
+                                    
+                                    # Get the matching transactions with their unique IDs
+                                    matching_transactions = trans_data[
+                                        trans_data['Transaction ID'].isin(matching_transaction_ids)
+                                    ]
+                                    
+                                    total_sum = matching_transactions['amount'].sum()
+                                    difference = abs(total_sum - target_amount)
+                                    
+                                    detailed_matches.append({
+                                        'Target_ID': target_id,
+                                        'Target_Amount': target_amount,
+                                        'Matching_Transaction_IDs': ', '.join(matching_transaction_ids),
+                                        'Matching_Amounts': ', '.join([f"{amt:.2f}" for amt in matching_transactions['amount']]),
+                                        'Total_Sum': total_sum,
+                                        'Difference': difference,
+                                        'Match_Count': len(matching_transactions)
+                                    })
+                                    
+                            except Exception as e:
+                                st.warning(f"Error processing target {target_row['Target ID']}: {str(e)}")
+                                continue
+                        
+                        if detailed_matches:
+                            matches_df = pd.DataFrame(detailed_matches)
+                            st.dataframe(matches_df, use_container_width=True)
+                            
+                            # Show expandable details for each match
+                            st.markdown("#### 📝 Detailed Match Breakdown")
+                            for idx, match in enumerate(detailed_matches):
+                                with st.expander(f"Match {idx+1}: {match['Target_ID']} → {match['Match_Count']} transactions"):
+                                    col1, col2 = st.columns(2)
+                                    with col1:
+                                        st.write(f"**Target:** {match['Target_ID']}")
+                                        st.write(f"**Target Amount:** {match['Target_Amount']:.2f}")
+                                        st.write(f"**Difference:** {match['Difference']:.4f}")
+                                    with col2:
+                                        st.write(f"**Transaction IDs:** {match['Matching_Transaction_IDs']}")
+                                        st.write(f"**Transaction Amounts:** {match['Matching_Amounts']}")
+                                        st.write(f"**Total Sum:** {match['Total_Sum']:.2f}")
+                        else:
+                            st.info("🔍 No exact subset matches found in the sample data")
+                            
+                            # Show some near misses or direct matches
+                            st.markdown("#### 🎯 Checking for Direct Amount Matches")
+                            direct_matches = []
+                            
+                            for _, target_row in target_data.head(5).iterrows():
+                                target_amount = target_row['amount']
+                                target_id = target_row['Target ID']
+                                
+                                # Find direct matches (within small tolerance)
+                                tolerance = 0.01
+                                direct_match_mask = abs(trans_data['amount'] - target_amount) <= tolerance
+                                direct_matching_trans = trans_data[direct_match_mask]
+                                
+                                if not direct_matching_trans.empty:
+                                    for _, trans_row in direct_matching_trans.iterrows():
+                                        direct_matches.append({
+                                            'Target_ID': target_id,
+                                            'Target_Amount': target_amount,
+                                            'Matching_Transaction_ID': trans_row['Transaction ID'],
+                                            'Transaction_Amount': trans_row['amount'],
+                                            'Difference': abs(trans_row['amount'] - target_amount)
+                                        })
+                            
+                            if direct_matches:
+                                st.write("**Direct matches found:**")
+                                direct_matches_df = pd.DataFrame(direct_matches)
+                                st.dataframe(direct_matches_df, use_container_width=True)
+                            else:
+                                st.info("No direct matches found either. Try adjusting the data or algorithms.")
+                
+                except Exception as e:
+                    st.error(f"Error during benchmarking: {str(e)}")
+                    st.error("Full error details:")
+                    st.code(traceback.format_exc())
+        
+        else:
+            st.info("👆 Please process the data first using the 'Process Data & Preview' button above.")
 
     # if st.button("📂 Run Multiple File Benchmark"):
     #     with st.spinner("Running multiple file benchmark..."):
