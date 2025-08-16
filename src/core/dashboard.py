@@ -13,8 +13,438 @@ from src.core.excel_processor import ExcelProcessor
 from src.core.data_storage import DataStorage
 from subsets.run_benchmarking import*
 import time
+import traceback
 
 
+# ===== HELPER FUNCTIONS =====
+
+def prepare_sample_data(trans_data, target_data, transaction_sample_size, target_sample_size):
+    """Prepare sampled data for benchmarking"""
+    # Sample transactions if requested
+    if transaction_sample_size > 0 and transaction_sample_size < len(trans_data):
+        trans_data = trans_data.sample(transaction_sample_size).copy().reset_index(drop=True)
+    
+    # Take first N targets if requested
+    if target_sample_size > 0 and target_sample_size < len(target_data):
+        target_data = target_data.head(target_sample_size).copy().reset_index(drop=True)
+    
+    return trans_data, target_data
+
+def update_method_results(method_name, result):
+    """Update method results in session state"""
+    # Remove existing result for this method
+    st.session_state.benchmark_results_individual = [
+        r for r in st.session_state.benchmark_results_individual 
+        if r["Method"] != method_name
+    ]
+    # Add new result
+    st.session_state.benchmark_results_individual.append(result)
+
+def display_method_results(result, show_details=False, show_ga_details=False):
+    """Display results for a single method"""
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric("⏱️ Time", result["Time Display"])
+    with col2:
+        st.metric("💾 Memory", f"{result['Memory (KB)']} KB")
+    with col3:
+        st.metric("🎯 Matches", result["Matches"])
+    with col4:
+        success_rate = (result["Matches"] / result["Targets Tested"]) * 100 if result["Targets Tested"] > 0 else 0
+        st.metric("📈 Success Rate", f"{success_rate:.1f}%")
+    
+    # Show detailed results if requested
+    if show_details and "Details" in result:
+        st.markdown("#### 📋 Detailed Results")
+        details = result["Details"]
+        
+        if "Task 2.1 Matches" in details and not details["Task 2.1 Matches"].empty:
+            st.markdown("**Direct Matches:**")
+            st.dataframe(details["Task 2.1 Matches"], use_container_width=True)
+        
+        if "Task 2.2 Matches" in details and not details["Task 2.2 Matches"].empty:
+            st.markdown("**Subset Sum Matches:**")
+            st.dataframe(details["Task 2.2 Matches"], use_container_width=True)
+    
+    if show_ga_details and "GA Results" in result:
+        st.markdown("#### 🧬 Genetic Algorithm Results")
+        ga_results = result["GA Results"]
+        
+        if ga_results:
+            ga_display = []
+            for i, (target, subset, achieved_sum, exact_match) in enumerate(ga_results[:10]):  # Show first 10
+                ga_display.append({
+                    "Target": f"{target:.2f}",
+                    "Achieved Sum": f"{achieved_sum:.2f}",
+                    "Difference": f"{abs(achieved_sum - target):.4f}",
+                    "Exact Match": "✅" if exact_match else "❌",
+                    "Subset Size": len(subset)
+                })
+            
+            if ga_display:
+                ga_df = pd.DataFrame(ga_display)
+                st.dataframe(ga_df, use_container_width=True)
+                
+                if len(ga_results) > 10:
+                    st.info(f"Showing first 10 results out of {len(ga_results)} total results")
+
+def show_detailed_matches(trans_data, target_data, brute_results, method_name):
+    """Show detailed matching results with Target IDs and amounts"""
+    st.markdown(f"#### 🔍 Detailed {method_name} Matches")
+    
+    # Show target amounts being tested
+    st.markdown("**🎯 Targets Being Tested:**")
+    target_display = target_data[['Target ID', 'amount']].copy()
+    target_display.columns = ['Target ID', 'Target Amount']
+    st.dataframe(target_display, use_container_width=True)
+    
+    # Show detailed match results
+    if 'Task 2.1 Matches' in brute_results and not brute_results['Task 2.1 Matches'].empty:
+        st.markdown("**✅ Direct Matches Found:**")
+        direct_matches = brute_results['Task 2.1 Matches'].copy()
+        st.dataframe(direct_matches, use_container_width=True)
+        
+        # Enhanced match details with IDs
+        st.markdown("**🔗 Match Details with IDs:**")
+        enhanced_matches = []
+        
+        for _, match_row in direct_matches.iterrows():
+            target_amount = match_row['target_amount']
+            trans_amount = match_row['transaction_amount']
+            
+            # Find corresponding target and transaction IDs
+            matching_targets = target_data[target_data['amount'] == target_amount]['Target ID'].tolist()
+            matching_trans = trans_data[trans_data['amount'] == trans_amount]['Transaction ID'].tolist()
+            
+            for target_id in matching_targets:
+                for trans_id in matching_trans:
+                    enhanced_matches.append({
+                        'Target_ID': target_id,
+                        'Target_Amount': target_amount,
+                        'Transaction_ID': trans_id,
+                        'Transaction_Amount': trans_amount,
+                        'Match_Type': 'Direct Match',
+                        'Difference': 0.0
+                    })
+        
+        if enhanced_matches:
+            enhanced_df = pd.DataFrame(enhanced_matches)
+            st.dataframe(enhanced_df, use_container_width=True)
+    
+    if 'Task 2.2 Matches' in brute_results and not brute_results['Task 2.2 Matches'].empty:
+        st.markdown("**🧩 Subset Sum Matches Found:**")
+        subset_matches = brute_results['Task 2.2 Matches'].copy()
+        st.dataframe(subset_matches, use_container_width=True)
+        
+        # Show subset details with transaction amounts
+        st.markdown("**📊 Subset Match Breakdown:**")
+        for _, subset_match in subset_matches.iterrows():
+            target_id = subset_match['Target Identifier']
+            matched_trans_ids = subset_match['Matched Transactions']
+            target_sum = subset_match['Sum']
+            
+            # Get target amount for this target ID
+            target_amount_info = target_data[target_data['Target ID'] == target_id]
+            if not target_amount_info.empty:
+                target_amount = target_amount_info.iloc[0]['amount']
+            else:
+                target_amount = target_sum
+            
+            with st.expander(f"🎯 {target_id} (Target: {target_amount:.2f}) → {len(matched_trans_ids)} transactions"):
+                # Show individual transaction details
+                subset_details = []
+                total_check = 0
+                
+                for trans_id in matched_trans_ids:
+                    trans_info = trans_data[trans_data['Transaction ID'] == trans_id]
+                    if not trans_info.empty:
+                        trans_amount = trans_info.iloc[0]['amount']
+                        total_check += trans_amount
+                        subset_details.append({
+                            'Transaction_ID': trans_id,
+                            'Amount': trans_amount
+                        })
+                
+                if subset_details:
+                    subset_df = pd.DataFrame(subset_details)
+                    st.dataframe(subset_df, use_container_width=True)
+                    
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Target Amount", f"{target_amount:.2f}")
+                    with col2:
+                        st.metric("Subset Sum", f"{total_check:.2f}")
+                    with col3:
+                        st.metric("Difference", f"{abs(total_check - target_amount):.4f}")
+    
+    # Show unmatched targets
+    if 'Task 2.1 Matches' in brute_results or 'Task 2.2 Matches' in brute_results:
+        matched_target_amounts = set()
+        
+        if 'Task 2.1 Matches' in brute_results and not brute_results['Task 2.1 Matches'].empty:
+            matched_target_amounts.update(brute_results['Task 2.1 Matches']['target_amount'].tolist())
+        
+        if 'Task 2.2 Matches' in brute_results and not brute_results['Task 2.2 Matches'].empty:
+            matched_target_amounts.update(brute_results['Task 2.2 Matches']['Sum'].tolist())
+        
+        unmatched_targets = target_data[~target_data['amount'].isin(matched_target_amounts)].copy()
+        
+        if not unmatched_targets.empty:
+            st.markdown("**❌ Unmatched Targets:**")
+            unmatched_display = unmatched_targets[['Target ID', 'amount']].copy()
+            unmatched_display.columns = ['Target ID', 'Target Amount']
+            st.dataframe(unmatched_display, use_container_width=True)
+        else:
+            st.success("🎉 All targets were successfully matched!")
+
+def show_dp_detailed_matches(trans_data, target_data, precision, max_sum_limit):
+    """Show detailed Dynamic Programming matching results"""
+    st.markdown("#### 🔍 Detailed Dynamic Programming Matches")
+    
+    # Show settings used
+    col1, col2 = st.columns(2)
+    with col1:
+        st.info(f"⚙️ Precision: {precision}")
+    with col2:
+        st.info(f"🎯 Max Sum Limit: {'Auto' if max_sum_limit == 0 else max_sum_limit}")
+    
+    # Show target amounts being tested
+    st.markdown("**🎯 Targets Being Tested:**")
+    target_display = target_data[['Target_ID', 'amount']].copy()
+    target_display.columns = ['Target ID', 'Target Amount']
+    st.dataframe(target_display, use_container_width=True)
+    
+    # Run detailed matching with results
+    st.markdown("**🔍 Individual Target Results:**")
+    
+    # transaction_tuples = list(zip(trans_data['amount'].tolist(), trans_data['Target_ID'].tolist()))
+    transaction_tuples = list(zip(trans_data['amount'].tolist(), trans_data['Transaction_ID'].tolist()))
+
+    detailed_results = []
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for i, (_, target_row) in enumerate(target_data.iterrows()):
+        try:
+            target_id = target_row['Target_ID']
+            target_amount = target_row['amount']
+            
+            result = subset_sum_exists(
+                transaction_tuples,
+                (target_amount, target_id),
+                max_sum=max_sum_limit if max_sum_limit > 0 else None,
+                precision=precision
+            )
+            
+            if result and len(result) >= 3:
+                success = result[0]
+                returned_target_id = result[1]
+                matching_trans_ids = result[2] if result[2] else []
+                
+                # Calculate actual sum if match found
+                actual_sum = 0
+                if success and matching_trans_ids:
+                    matching_trans = trans_data[trans_data['Target_ID'].isin(matching_trans_ids)]
+                    actual_sum = matching_trans['amount'].sum()
+                
+                detailed_results.append({
+                    'Target_ID': target_id,
+                    'Target_Amount': target_amount,
+                    'Match_Found': '✅' if success else '❌',
+                    'Matching_Transactions': ', '.join(matching_trans_ids) if matching_trans_ids else 'None',
+                    'Actual_Sum': actual_sum if success else 0,
+                    'Difference': abs(actual_sum - target_amount) if success else 'N/A',
+                    'Transaction_Count': len(matching_trans_ids) if matching_trans_ids else 0
+                })
+            else:
+                detailed_results.append({
+                    'Target_ID': target_id,
+                    'Target_Amount': target_amount,
+                    'Match_Found': '❌',
+                    'Matching_Transactions': 'None',
+                    'Actual_Sum': 0,
+                    'Difference': 'N/A',
+                    'Transaction_Count': 0
+                })
+            
+            # Update progress
+            progress = (i + 1) / len(target_data)
+            progress_bar.progress(progress)
+            status_text.text(f"Processing target {i+1}/{len(target_data)}: {target_id}")
+            
+        except Exception as e:
+            st.warning(f"Error processing target {target_row['Target_ID']}: {str(e)}")
+            detailed_results.append({
+                'Target_ID': target_row['Target_ID'],
+                'Target_Amount': target_row['amount'],
+                'Match_Found': '⚠️ Error',
+                'Matching_Transactions': 'Error',
+                'Actual_Sum': 0,
+                'Difference': 'Error',
+                'Transaction_Count': 0
+            })
+    
+    progress_bar.empty()
+    status_text.empty()
+    
+    # Display results
+    if detailed_results:
+        results_df = pd.DataFrame(detailed_results)
+        st.dataframe(results_df, use_container_width=True)
+        
+        # Summary statistics
+        successful_matches = len([r for r in detailed_results if r['Match_Found'] == '✅'])
+        failed_matches = len([r for r in detailed_results if r['Match_Found'] == '❌'])
+        error_matches = len([r for r in detailed_results if r['Match_Found'] == '⚠️ Error'])
+        
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("✅ Successful", successful_matches)
+        with col2:
+            st.metric("❌ Failed", failed_matches)
+        with col3:
+            st.metric("⚠️ Errors", error_matches)
+        with col4:
+            success_rate = (successful_matches / len(detailed_results)) * 100 if detailed_results else 0
+            st.metric("Success Rate", f"{success_rate:.1f}%")
+        
+        # Show detailed breakdown for successful matches
+        successful_results = [r for r in detailed_results if r['Match_Found'] == '✅']
+        if successful_results:
+            st.markdown("**🎉 Successful Matches Breakdown:**")
+            for result in successful_results[:5]:  # Show first 5 successful matches
+                with st.expander(f"🎯 {result['Target_ID']} (Target: {result['Target_Amount']:.2f})"):
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.write(f"**Target Amount:** {result['Target_Amount']:.2f}")
+                        st.write(f"**Actual Sum:** {result['Actual_Sum']:.2f}")
+                        st.write(f"**Difference:** {result['Difference']}")
+                    with col2:
+                        st.write(f"**Transaction Count:** {result['Transaction_Count']}")
+                        st.write(f"**Transaction IDs:** {result['Matching_Transactions']}")
+                        
+                        # Show individual transaction details
+                        if result['Matching_Transactions'] != 'None':
+                            trans_ids = result['Matching_Transactions'].split(', ')
+                            trans_details = trans_data[trans_data['Target_ID'].isin(trans_ids)][['Target_ID', 'amount']]
+                            if not trans_details.empty:
+                                st.dataframe(trans_details, use_container_width=True)
+
+def show_ga_detailed_matches(trans_data, target_data, ga_results):
+    """Show detailed Genetic Algorithm matching results"""
+    st.markdown("#### 🧬 Detailed Genetic Algorithm Results")
+    
+    # Show target amounts being tested
+    st.markdown("**🎯 Targets Being Tested:**")
+    target_display = target_data[['Target_ID', 'amount']].copy()
+    target_display.columns = ['Target ID', 'Target Amount']
+    st.dataframe(target_display, use_container_width=True)
+    
+    if ga_results:
+        # Create comprehensive results table
+        detailed_ga_results = []
+        
+        for i, (target_amount, subset, achieved_sum, exact_match) in enumerate(ga_results):
+            # Get corresponding target ID
+            target_id = f"TG_{i+1:04d}"  # Assuming sequential target IDs
+            if i < len(target_data):
+                target_id = target_data.iloc[i]['Target_ID']
+            
+            # Calculate subset details
+            subset_transactions = []
+            if subset:
+                # Find transaction IDs corresponding to subset values
+                for subset_amount in subset:
+                    matching_trans = trans_data[abs(trans_data['amount'] - subset_amount) < 0.001]
+                    if not matching_trans.empty:
+                        # subset_transactions.append(matching_trans.iloc[0]['Target_ID'])
+                        subset_transactions.append(matching_trans.iloc[0]['Transaction_ID'])
+            
+            fuzzy_ratio = max(0, 100 * (1 - abs(target_amount - achieved_sum) / max(abs(target_amount), 1)))
+            
+            detailed_ga_results.append({
+                'Target_ID': target_id,
+                'Target_Amount': target_amount,
+                'Achieved_Sum': achieved_sum,
+                'Difference': abs(achieved_sum - target_amount),
+                'Exact_Match': '✅' if exact_match else '❌',
+                'Fuzzy_Ratio': f"{fuzzy_ratio:.1f}%",
+                'Subset_Size': len(subset),
+                'Subset_Values': ', '.join([f"{val:.2f}" for val in subset]) if subset else 'None',
+                'Transaction_IDs': ', '.join(subset_transactions) if subset_transactions else 'None'
+            })
+        
+        # Display results table
+        st.markdown("**📊 GA Results Summary:**")
+        ga_df = pd.DataFrame(detailed_ga_results)
+        st.dataframe(ga_df, use_container_width=True)
+        
+        # Summary statistics
+        exact_matches = len([r for r in detailed_ga_results if r['Exact_Match'] == '✅'])
+        high_fuzzy = len([r for r in detailed_ga_results if float(r['Fuzzy_Ratio'].rstrip('%')) >= 90])
+        
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("🎯 Exact Matches", exact_matches)
+        with col2:
+            st.metric("📈 High Accuracy (>90%)", high_fuzzy)
+        with col3:
+            avg_fuzzy = sum(float(r['Fuzzy_Ratio'].rstrip('%')) for r in detailed_ga_results) / len(detailed_ga_results)
+            st.metric("📊 Avg Accuracy", f"{avg_fuzzy:.1f}%")
+        with col4:
+            avg_diff = sum(r['Difference'] for r in detailed_ga_results) / len(detailed_ga_results)
+            st.metric("📏 Avg Difference", f"{avg_diff:.4f}")
+        
+        # Show detailed breakdown for best matches
+        st.markdown("**🏆 Best Matches Breakdown:**")
+        sorted_results = sorted(detailed_ga_results, key=lambda x: float(x['Fuzzy_Ratio'].rstrip('%')), reverse=True)
+        
+        for i, result in enumerate(sorted_results[:5]):  # Show top 5 matches
+            accuracy = float(result['Fuzzy_Ratio'].rstrip('%'))
+            status_emoji = "🎯" if result['Exact_Match'] == '✅' else "📈" if accuracy >= 90 else "📊"
+            
+            with st.expander(f"{status_emoji} {result['Target_ID']} - {result['Fuzzy_Ratio']} accuracy (Target: {result['Target_Amount']:.2f})"):
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.write(f"**Target ID:** {result['Target_ID']}")
+                    st.write(f"**Target Amount:** {result['Target_Amount']:.2f}")
+                    st.write(f"**Achieved Sum:** {result['Achieved_Sum']:.2f}")
+                    st.write(f"**Difference:** {result['Difference']:.4f}")
+                    st.write(f"**Accuracy:** {result['Fuzzy_Ratio']}")
+                
+                with col2:
+                    st.write(f"**Subset Size:** {result['Subset_Size']}")
+                    st.write(f"**Exact Match:** {result['Exact_Match']}")
+                    if result['Subset_Values'] != 'None':
+                        st.write("**Subset Values:**")
+                        st.text(result['Subset_Values'])
+                    if result['Transaction_IDs'] != 'None':
+                        st.write("**Transaction IDs:**")
+                        st.text(result['Transaction_IDs'])
+                
+                # Progress bar for accuracy
+                accuracy_val = float(result['Fuzzy_Ratio'].rstrip('%')) / 100
+                st.progress(accuracy_val)
+        
+        # Show histogram of accuracy distribution
+        st.markdown("**📈 Accuracy Distribution:**")
+        accuracy_values = [float(r['Fuzzy_Ratio'].rstrip('%')) for r in detailed_ga_results]
+        
+        import plotly.graph_objects as go
+        fig = go.Figure(data=[go.Histogram(x=accuracy_values, nbinsx=20)])
+        fig.update_layout(
+            title="Distribution of GA Match Accuracy",
+            xaxis_title="Accuracy (%)",
+            yaxis_title="Count",
+            showlegend=False
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        
+    else:
+        st.warning("No GA results available to display.")
 
 # Page configuration
 st.set_page_config(
@@ -663,7 +1093,6 @@ elif page == "🧪 Performance":
                     with st.expander("📄 View Partial Benchmark Output"):
                         st.text(output)
 
-
 elif page == "💰 Subset Sum":
     st.title("💰 Subset Sum Benchmarking")
     
@@ -822,11 +1251,12 @@ elif page == "💰 Subset Sum":
                 st.code(traceback.format_exc())
         
         # -------------------------------
-        # Benchmark Settings (only show if data is processed)
+        # Benchmark Settings and Method Selection
         # -------------------------------
         if 'processed_transactions' in st.session_state and 'processed_targets' in st.session_state:
             st.markdown("### ⚙️ Benchmark Settings")
             
+            # Data sampling settings
             col1, col2 = st.columns(2)
             
             with col1:
@@ -835,7 +1265,7 @@ elif page == "💰 Subset Sum":
                 target_sample_size = st.number_input(
                     "Number of targets to test (0 for all)",
                     min_value=0,
-                    max_value=min(50, max_targets),  # Limit for performance
+                    max_value=min(50, max_targets),
                     value=min(10, max_targets),
                     help="Number of targets to use for benchmarking (smaller = faster)",
                     key="target_sample_size"
@@ -847,212 +1277,389 @@ elif page == "💰 Subset Sum":
                 transaction_sample_size = st.number_input(
                     "Number of transactions to use (0 for all)",
                     min_value=0,
-                    max_value=min(1000, max_transactions),  # Limit for performance
+                    max_value=min(1000, max_transactions),
                     value=min(100, max_transactions),
                     help="Number of transactions to use for matching (smaller = faster)",
                     key="transaction_sample_size"
                 )
             
-            if st.button("🏃‍♂️ Run Benchmark"):
-                try:
-                    # Get processed data
-                    trans_data = st.session_state.processed_transactions.copy()
-                    target_data = st.session_state.processed_targets.copy()
+            # Initialize benchmark results in session state if not exists
+            if 'benchmark_results_individual' not in st.session_state:
+                st.session_state.benchmark_results_individual = []
+            
+            # Method selection and individual benchmarking
+            st.markdown("### 🎯 Select Method to Benchmark")
+            
+            # Create tabs for each method
+            tab1, tab2, tab3, tab4 = st.tabs(["🐌 Brute Force", "⚡ Dynamic Programming", "🧬 Genetic Algorithm", "📊 Compare Results"])
+            
+            # ===== TAB 1: BRUTE FORCE =====
+            with tab1:
+                st.markdown("#### 🐌 Brute Force Method")
+                st.info("⚠️ Warning: Brute force can be very slow for large datasets. Recommended for small datasets only.")
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.write(f"**Current Selection:**")
+                    st.write(f"• Transactions: {transaction_sample_size if transaction_sample_size > 0 else len(st.session_state.processed_transactions)}")
+                    st.write(f"• Targets: {target_sample_size if target_sample_size > 0 else len(st.session_state.processed_targets)}")
+                
+                with col2:
+                    # Estimated complexity warning
+                    actual_trans = transaction_sample_size if transaction_sample_size > 0 else len(st.session_state.processed_transactions)
+                    actual_targets = target_sample_size if target_sample_size > 0 else len(st.session_state.processed_targets)
+                    complexity_estimate = (2 ** min(actual_trans, 20)) * actual_targets  # Cap at 2^20 for safety
                     
-                    # Sample transactions if requested
-                    if transaction_sample_size > 0 and transaction_sample_size < len(trans_data):
-                        trans_data = trans_data.sample(transaction_sample_size).copy().reset_index(drop=True)
-                        st.info(f"🔄 Using {len(trans_data)} sampled transactions out of {len(st.session_state.processed_transactions)} total")
-                    
-                    # Sample targets if requested
-                    if target_sample_size > 0 and target_sample_size < len(target_data):
-                        target_data = target_data.sample(target_sample_size).copy().reset_index(drop=True)
-                        st.info(f"🎯 Testing {len(target_data)} sampled targets out of {len(st.session_state.processed_targets)} total")
-                    
-                    # Display final data selection summary
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.metric("Selected Transactions", len(trans_data))
-                        st.write(f"Amount range: {trans_data['amount'].min():.2f} - {trans_data['amount'].max():.2f}")
-                    with col2:
-                        st.metric("Selected Targets", len(target_data))
-                        st.write(f"Amount range: {target_data['amount'].min():.2f} - {target_data['amount'].max():.2f}")
-                    
-                    # Rename columns to match backend expectations
-                    trans_data = trans_data.rename(columns={'Transaction_ID': 'Transaction ID'})
-                    target_data = target_data.rename(columns={'Target_ID': 'Target ID'})
-                    
-                    with st.spinner("Running benchmark..."):
-                        st.info(f"🔄 Running benchmark with {len(trans_data)} transactions and {len(target_data)} targets...")
+                    if actual_trans > 15:
+                        st.warning(f"⚠️ High complexity: ~{complexity_estimate:,.0f} operations")
+                        st.write("Consider reducing transaction count to < 15 for reasonable performance")
+                    else:
+                        st.success(f"✅ Manageable complexity: ~{complexity_estimate:,.0f} operations")
+                
+                if st.button("🐌 Run Brute Force", key="run_brute_force"):
+                    try:
+                        trans_data, target_data = prepare_sample_data(
+                            st.session_state.processed_transactions.copy(),
+                            st.session_state.processed_targets.copy(),
+                            transaction_sample_size,
+                            target_sample_size
+                        )
                         
-                        # Run benchmark
-                        benchmark_results = benchmark_methods(trans_data, target_data)
+                        # Run brute force with progress tracking
+                        with st.spinner("Running Brute Force method..."):
+                            start_time = time.time()
+                            tracemalloc.start()
+                            
+                            # Limit brute force for safety
+                            safe_targets = min(len(target_data), 5) if len(st.session_state.processed_transactions) > 100 else len(target_data)
+                            limited_target_data = target_data.head(safe_targets).copy()
+                            
+                            # Rename columns for brute_force_subset function
+                            trans_data_bf = trans_data.rename(columns={'Transaction_ID': 'Transaction ID'})
+                            target_data_bf = limited_target_data.rename(columns={'Target_ID': 'Target ID'})
+                            
+                            brute_results = brute_force_subset(trans_data_bf, target_data_bf)
+                            
+                            # Count matches
+                            brute_force_matches = 0
+                            if 'Task 2.1 Matches' in brute_results and not brute_results['Task 2.1 Matches'].empty:
+                                brute_force_matches += len(brute_results['Task 2.1 Matches'])
+                            if 'Task 2.2 Matches' in brute_results and not brute_results['Task 2.2 Matches'].empty:
+                                brute_force_matches += len(brute_results['Task 2.2 Matches'])
+                            
+                            elapsed = time.time() - start_time
+                            _, peak = tracemalloc.get_traced_memory()
+                            tracemalloc.stop()
+                        
+                        # Store results
+                        method_result = {
+                            "Method": "Brute Force",
+                            "Time (s)": round(elapsed, 3),
+                            "Time Display": format_time(elapsed),
+                            "Memory (KB)": round(peak / 1024, 2),
+                            "Matches": brute_force_matches,
+                            "Targets Tested": len(limited_target_data),
+                            "Transactions Used": len(trans_data),
+                            "Details": brute_results
+                        }
+                        
+                        # Update session state
+                        update_method_results("Brute Force", method_result)
                         
                         # Display results
-                        st.markdown("### 📊 Benchmark Results")
+                        st.success(f"✅ Brute Force completed in {format_time(elapsed)}")
+                        display_method_results(method_result, show_details=True)
                         
-                        col1, col2, col3, col4 = st.columns(4)
-                        with col1:
-                            st.metric("Transactions Used", len(trans_data))
-                        with col2:
-                            st.metric("Targets Processed", len(target_data))
-                        with col3:
-                            if len(trans_data) < len(st.session_state.processed_transactions):
-                                st.metric("Transaction Sample %", f"{len(trans_data)/len(st.session_state.processed_transactions)*100:.1f}%")
-                            else:
-                                st.metric("Transaction Sample %", "100%")
-                        with col4:
-                            if len(target_data) < len(st.session_state.processed_targets):
-                                st.metric("Target Sample %", f"{len(target_data)/len(st.session_state.processed_targets)*100:.1f}%")
-                            else:
-                                st.metric("Target Sample %", "100%")
+                        # Show detailed target matching results
+                        show_detailed_matches(trans_data_bf, target_data_bf, brute_results, "Brute Force")
                         
-                        st.dataframe(benchmark_results, use_container_width=True)
-                        
-                        # -------------------------------
-                        # Visualizations
-                        # -------------------------------
-                        if not benchmark_results.empty:
-                            st.markdown("### 📈 Performance Comparison")
-                            
-                            # Filter valid results for plotting
-                            valid_results = benchmark_results[
-                                (benchmark_results['Time (ms)'] != 'Error') & 
-                                (benchmark_results['Time (ms)'] != float('inf'))
-                            ].copy()
-                            
-                            if not valid_results.empty:
-                                valid_results['Time (ms)'] = pd.to_numeric(valid_results['Time (ms)'], errors='coerce')
-                                
-                                col1, col2 = st.columns(2)
-                                with col1:
-                                    fig_time = px.bar(
-                                        valid_results,
-                                        x='Method',
-                                        y='Time (ms)',
-                                        color='Method',
-                                        title="Execution Time"
-                                    )
-                                    st.plotly_chart(fig_time, use_container_width=True)
-                                
-                                with col2:
-                                    fig_mem = px.bar(
-                                        valid_results,
-                                        x='Method',
-                                        y='Memory (KB)',
-                                        color='Method',
-                                        title="Memory Usage"
-                                    )
-                                    st.plotly_chart(fig_mem, use_container_width=True)
-                        
-                        # -------------------------------
-                        # Show detailed matches with unique IDs
-                        # -------------------------------
-                        st.markdown("### 🔍 Match Details with Unique IDs")
-                        
-                        detailed_matches = []
-                        
-                        # Test first few targets for detailed matching
-                        for _, target_row in target_data.head(5).iterrows():
-                            try:
-                                target_amount = target_row['amount']
-                                target_id = target_row['Target ID']
-                                
-                                # Create transaction tuples for subset_sum_exists
-                                transaction_tuples = list(zip(
-                                    trans_data['amount'].tolist(),
-                                    trans_data['Transaction ID'].tolist()
-                                ))
-                                
-                                # Try to find subset sum match
-                                result = subset_sum_exists(
-                                    transaction_tuples,
-                                    (float(target_amount), target_id),
-                                    precision=100
-                                )
-                                
-                                if result and len(result) > 0 and result[0]:  # Match found
-                                    matching_transaction_ids = result[2] if len(result) > 2 else []
-                                    
-                                    # Get the matching transactions with their unique IDs
-                                    matching_transactions = trans_data[
-                                        trans_data['Transaction ID'].isin(matching_transaction_ids)
-                                    ]
-                                    
-                                    total_sum = matching_transactions['amount'].sum()
-                                    difference = abs(total_sum - target_amount)
-                                    
-                                    detailed_matches.append({
-                                        'Target_ID': target_id,
-                                        'Target_Amount': target_amount,
-                                        'Matching_Transaction_IDs': ', '.join(matching_transaction_ids),
-                                        'Matching_Amounts': ', '.join([f"{amt:.2f}" for amt in matching_transactions['amount']]),
-                                        'Total_Sum': total_sum,
-                                        'Difference': difference,
-                                        'Match_Count': len(matching_transactions)
-                                    })
-                                    
-                            except Exception as e:
-                                st.warning(f"Error processing target {target_row['Target ID']}: {str(e)}")
-                                continue
-                        
-                        if detailed_matches:
-                            matches_df = pd.DataFrame(detailed_matches)
-                            st.dataframe(matches_df, use_container_width=True)
-                            
-                            # Show expandable details for each match
-                            st.markdown("#### 📝 Detailed Match Breakdown")
-                            for idx, match in enumerate(detailed_matches):
-                                with st.expander(f"Match {idx+1}: {match['Target_ID']} → {match['Match_Count']} transactions"):
-                                    col1, col2 = st.columns(2)
-                                    with col1:
-                                        st.write(f"**Target:** {match['Target_ID']}")
-                                        st.write(f"**Target Amount:** {match['Target_Amount']:.2f}")
-                                        st.write(f"**Difference:** {match['Difference']:.4f}")
-                                    with col2:
-                                        st.write(f"**Transaction IDs:** {match['Matching_Transaction_IDs']}")
-                                        st.write(f"**Transaction Amounts:** {match['Matching_Amounts']}")
-                                        st.write(f"**Total Sum:** {match['Total_Sum']:.2f}")
-                        else:
-                            st.info("🔍 No exact subset matches found in the sample data")
-                            
-                            # Show some near misses or direct matches
-                            st.markdown("#### 🎯 Checking for Direct Amount Matches")
-                            direct_matches = []
-                            
-                            for _, target_row in target_data.head(5).iterrows():
-                                target_amount = target_row['amount']
-                                target_id = target_row['Target ID']
-                                
-                                # Find direct matches (within small tolerance)
-                                tolerance = 0.01
-                                direct_match_mask = abs(trans_data['amount'] - target_amount) <= tolerance
-                                direct_matching_trans = trans_data[direct_match_mask]
-                                
-                                if not direct_matching_trans.empty:
-                                    for _, trans_row in direct_matching_trans.iterrows():
-                                        direct_matches.append({
-                                            'Target_ID': target_id,
-                                            'Target_Amount': target_amount,
-                                            'Matching_Transaction_ID': trans_row['Transaction ID'],
-                                            'Transaction_Amount': trans_row['amount'],
-                                            'Difference': abs(trans_row['amount'] - target_amount)
-                                        })
-                            
-                            if direct_matches:
-                                st.write("**Direct matches found:**")
-                                direct_matches_df = pd.DataFrame(direct_matches)
-                                st.dataframe(direct_matches_df, use_container_width=True)
-                            else:
-                                st.info("No direct matches found either. Try adjusting the data or algorithms.")
+                    except Exception as e:
+                        st.error(f"❌ Brute Force failed: {str(e)}")
+                        st.code(traceback.format_exc())
+            
+            # ===== TAB 2: DYNAMIC PROGRAMMING =====
+            with tab2:
+                st.markdown("#### ⚡ Dynamic Programming Method")
+                st.info("💡 Good for medium-sized datasets with reasonable precision requirements.")
                 
-                except Exception as e:
-                    st.error(f"Error during benchmarking: {str(e)}")
-                    st.error("Full error details:")
-                    st.code(traceback.format_exc())
+                col1, col2 = st.columns(2)
+                with col1:
+                    precision = st.selectbox(
+                        "Precision (for decimal handling)",
+                        [1, 10, 100, 1000],
+                        index=2,
+                        help="Higher precision = more memory usage"
+                    )
+                
+                with col2:
+                    max_sum_limit = st.number_input(
+                        "Max Sum Limit (0 for auto)",
+                        min_value=0,
+                        value=0,
+                        help="Limits memory usage by capping the sum range"
+                    )
+                
+                if st.button("⚡ Run Dynamic Programming", key="run_dp"):
+                    try:
+                        trans_data, target_data = prepare_sample_data(
+                            st.session_state.processed_transactions.copy(),
+                            st.session_state.processed_targets.copy(),
+                            transaction_sample_size,
+                            target_sample_size
+                        )
+                        
+                        with st.spinner("Running Dynamic Programming method..."):
+                            start_time = time.time()
+                            tracemalloc.start()
+                            
+                            dp_matches = 0
+                            transaction_tuples = list(zip(trans_data['amount'].tolist(), trans_data['Transaction_ID'].tolist()))
+                            
+                            # Progress bar for DP
+                            progress_bar = st.progress(0)
+                            status_text = st.empty()
+                            
+                            for i, (_, target_row) in enumerate(target_data.iterrows()):
+                                try:
+                                    result = subset_sum_exists(
+                                        transaction_tuples,
+                                        (target_row['amount'], target_row['Target_ID']),
+                                        max_sum=max_sum_limit if max_sum_limit > 0 else None,
+                                        precision=precision
+                                    )
+                                    if result and len(result) > 0 and result[0]:
+                                        dp_matches += 1
+                                    
+                                    # Update progress
+                                    progress = (i + 1) / len(target_data)
+                                    progress_bar.progress(progress)
+                                    status_text.text(f"Processing target {i+1}/{len(target_data)} - Found {dp_matches} matches so far")
+                                    
+                                except Exception as e:
+                                    st.warning(f"DP error for target {target_row['Target_ID']}: {str(e)}")
+                                    continue
+                            
+                            progress_bar.empty()
+                            status_text.empty()
+                            
+                            elapsed = time.time() - start_time
+                            _, peak = tracemalloc.get_traced_memory()
+                            tracemalloc.stop()
+                        
+                        # Store results
+                        method_result = {
+                            "Method": "Dynamic Programming",
+                            "Time (s)": round(elapsed, 3),
+                            "Time Display": format_time(elapsed),
+                            "Memory (KB)": round(peak / 1024, 2),
+                            "Matches": dp_matches,
+                            "Targets Tested": len(target_data),
+                            "Transactions Used": len(trans_data),
+                            "Settings": {"Precision": precision, "Max Sum Limit": max_sum_limit}
+                        }
+                        
+                        update_method_results("Dynamic Programming", method_result)
+                        
+                        st.success(f"✅ Dynamic Programming completed in {format_time(elapsed)}")
+                        display_method_results(method_result)
+                        
+                        # Show detailed DP matching results
+                        show_dp_detailed_matches(trans_data, target_data, precision, max_sum_limit)
+                        
+                    except Exception as e:
+                        st.error(f"❌ Dynamic Programming failed: {str(e)}")
+                        st.code(traceback.format_exc())
+            
+            # ===== TAB 3: GENETIC ALGORITHM =====
+            with tab3:
+                st.markdown("#### 🧬 Genetic Algorithm Method")
+                st.info("🔬 Approximation method - good for large datasets, may not find exact matches.")
+                
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    pop_size = st.number_input("Population Size", min_value=10, max_value=500, value=100)
+                    gen_count = st.number_input("Generations", min_value=10, max_value=1000, value=200)
+                
+                with col2:
+                    mut_rate = st.slider("Mutation Rate", 0.01, 0.2, 0.05, 0.01)
+                    elite_size = st.number_input("Elite Size", min_value=1, max_value=20, value=5)
+                
+                with col3:
+                    tourn_size = st.number_input("Tournament Size", min_value=2, max_value=10, value=3)
+                    early_stop = st.checkbox("Early Stopping", value=True)
+                
+                if st.button("🧬 Run Genetic Algorithm", key="run_ga"):
+                    try:
+                        trans_data, target_data = prepare_sample_data(
+                            st.session_state.processed_transactions.copy(),
+                            st.session_state.processed_targets.copy(),
+                            transaction_sample_size,
+                            target_sample_size
+                        )
+                        
+                        with st.spinner("Running Genetic Algorithm method..."):
+                            start_time = time.time()
+                            tracemalloc.start()
+                            
+                            ga_solver = SubsetSumGA(
+                                trans_data['amount'].tolist(),
+                                target_data['amount'].tolist(),
+                                pop_size=pop_size,
+                                gen_count=gen_count,
+                                mut_rate=mut_rate,
+                                elite_size=elite_size,
+                                tourn_size=tourn_size
+                            )
+                            
+                            # Progress tracking for GA
+                            progress_container = st.container()
+                            with progress_container:
+                                st.write("🧬 Evolution in progress...")
+                                ga_progress = st.progress(0)
+                                ga_status = st.empty()
+                            
+                            # Run GA with custom progress callback (if available)
+                            ga_results = ga_solver.find_subsets(verbose=False)
+                            
+                            # Clean up progress indicators
+                            ga_progress.empty()
+                            ga_status.empty()
+                            
+                            # Count matches
+                            ga_matches = 0
+                            exact_matches = 0
+                            if hasattr(ga_results, '__len__'):
+                                ga_matches = len([r for r in ga_results if r is not None])
+                                # Check for exact matches
+                                for result in ga_results:
+                                    if result and len(result) >= 4 and result[3]:  # exact_match flag
+                                        exact_matches += 1
+                            
+                            elapsed = time.time() - start_time
+                            _, peak = tracemalloc.get_traced_memory()
+                            tracemalloc.stop()
+                        
+                        # Store results
+                        method_result = {
+                            "Method": "Genetic Algorithm",
+                            "Time (s)": round(elapsed, 3),
+                            "Time Display": format_time(elapsed),
+                            "Memory (KB)": round(peak / 1024, 2),
+                            "Matches": ga_matches,
+                            "Exact Matches": exact_matches,
+                            "Targets Tested": len(target_data),
+                            "Transactions Used": len(trans_data),
+                            "Settings": {
+                                "Population Size": pop_size,
+                                "Generations": gen_count,
+                                "Mutation Rate": mut_rate,
+                                "Elite Size": elite_size
+                            },
+                            "GA Results": ga_results
+                        }
+                        
+                        update_method_results("Genetic Algorithm", method_result)
+                        
+                        st.success(f"✅ Genetic Algorithm completed in {format_time(elapsed)}")
+                        display_method_results(method_result, show_ga_details=True)
+                        
+                        # Show detailed GA matching results
+                        show_ga_detailed_matches(trans_data, target_data, ga_results)
+                        
+                    except Exception as e:
+                        st.error(f"❌ Genetic Algorithm failed: {str(e)}")
+                        st.code(traceback.format_exc())
+            
+            # ===== TAB 4: COMPARE RESULTS =====
+            with tab4:
+                st.markdown("#### 📊 Compare All Results")
+                
+                # Show current target amounts being tested
+                st.markdown("#### 🎯 Current Target Data Preview")
+                if 'processed_targets' in st.session_state:
+                    target_preview = st.session_state.processed_targets.copy()
+                    # Apply sampling to show what will be tested
+                    if target_sample_size > 0 and target_sample_size < len(target_preview):
+                        target_preview = target_preview.head(target_sample_size)
+                    
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.markdown("**Target IDs and Amounts:**")
+                        display_targets = target_preview[['Target_ID', 'amount']].copy()
+                        display_targets.columns = ['Target ID', 'Target Amount']
+                        st.dataframe(display_targets, use_container_width=True)
+                    
+                    with col2:
+                        st.markdown("**Target Statistics:**")
+                        st.metric("Total Targets", len(target_preview))
+                        st.metric("Amount Range", f"{target_preview['amount'].min():.2f} - {target_preview['amount'].max():.2f}")
+                        st.metric("Average Amount", f"{target_preview['amount'].mean():.2f}")
+                        st.metric("Median Amount", f"{target_preview['amount'].median():.2f}")
+                
+                if st.session_state.benchmark_results_individual:
+                    st.markdown("#### 📈 Method Performance Comparison")
+                    # Create comparison table
+                    comparison_data = []
+                    for result in st.session_state.benchmark_results_individual:
+                        comparison_data.append({
+                            "Method": result["Method"],
+                            "Time": result["Time Display"],
+                            "Memory (KB)": result["Memory (KB)"],
+                            "Matches": result["Matches"],
+                            "Targets Tested": result["Targets Tested"],
+                            "Transactions Used": result["Transactions Used"]
+                        })
+                    
+                    comparison_df = pd.DataFrame(comparison_data)
+                    st.dataframe(comparison_df, use_container_width=True)
+                    
+                    # Performance charts
+                    if len(comparison_data) > 1:
+                        st.markdown("### 📈 Performance Comparison")
+                        
+                        # Extract numeric time data for plotting
+                        plot_data = []
+                        for result in st.session_state.benchmark_results_individual:
+                            if result["Time (s)"] != float('inf'):
+                                plot_data.append({
+                                    "Method": result["Method"],
+                                    "Time (s)": result["Time (s)"],
+                                    "Memory (KB)": result["Memory (KB)"],
+                                    "Match Rate (%)": (result["Matches"] / result["Targets Tested"]) * 100 if result["Targets Tested"] > 0 else 0
+                                })
+                        
+                        if plot_data:
+                            plot_df = pd.DataFrame(plot_data)
+                            
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                fig_time = px.bar(plot_df, x='Method', y='Time (s)', 
+                                               title="Execution Time Comparison")
+                                st.plotly_chart(fig_time, use_container_width=True)
+                            
+                            with col2:
+                                fig_mem = px.bar(plot_df, x='Method', y='Memory (KB)', 
+                                               title="Memory Usage Comparison")
+                                st.plotly_chart(fig_mem, use_container_width=True)
+                            
+                            # Match rate comparison
+                            fig_matches = px.bar(plot_df, x='Method', y='Match Rate (%)', 
+                                               title="Match Success Rate")
+                            st.plotly_chart(fig_matches, use_container_width=True)
+                    
+                    # Clear results button
+                    if st.button("🗑️ Clear All Results"):
+                        st.session_state.benchmark_results_individual = []
+                        st.success("✅ Results cleared!")
+                        st.rerun()
+                        
+                else:
+                    st.info("🔍 No benchmark results available. Run some methods first!")
         
         else:
             st.info("👆 Please process the data first using the 'Process Data & Preview' button above.")
+
+
 
     # if st.button("📂 Run Multiple File Benchmark"):
     #     with st.spinner("Running multiple file benchmark..."):

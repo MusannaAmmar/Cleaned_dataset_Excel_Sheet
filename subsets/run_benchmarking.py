@@ -2,16 +2,26 @@ import os
 import time
 import tracemalloc
 import pandas as pd
-import matplotlib.pyplot as plt
+# import matplotlib.pyplot as plt
 from subsets.ga_subset import SubsetSumGA
 from subsets.dp_subsets import subset_sum_exists
 from subsets.brute_force import *
 
+
+
+def format_time(elapsed_seconds: float) -> str:
+    """Format elapsed time into ms, s, or min."""
+    if elapsed_seconds < 1:
+        return f"{elapsed_seconds*1000:.2f} ms"
+    elif elapsed_seconds < 60:
+        return f"{elapsed_seconds:.2f} s"
+    else:
+        minutes = int(elapsed_seconds // 60)
+        seconds = elapsed_seconds % 60
+        return f"{minutes}m {seconds:.2f}s"
+
+
 def benchmark_methods(transactions_df, targets_df):
-    import time
-    import tracemalloc
-    import pandas as pd
-    import matplotlib.pyplot as plt
 
     results = []
 
@@ -86,24 +96,29 @@ def benchmark_methods(transactions_df, targets_df):
         if 'Task 2.2 Matches' in brute_results and not brute_results['Task 2.2 Matches'].empty:
             brute_force_matches += len(brute_results['Task 2.2 Matches'])
         
-        elapsed = (time.time() - start) * 1000
+        elapsed = time.time() - start
+        elapsed_ms = elapsed * 1000  # Convert to milliseconds for graphs
         _, peak = tracemalloc.get_traced_memory()
         tracemalloc.stop()
         results.append({
             "Method": "Brute Force", 
-            "Time (ms)": round(elapsed, 2), 
+            "Time (s)": round(elapsed, 3),  # Time in seconds for table
+            "Time (ms)": round(elapsed_ms, 2),  # Time in milliseconds for graphs
+            "Time Display": format_time(elapsed),  # Formatted time for display
             "Memory (KB)": round(peak / 1024, 2), 
             "Matches": brute_force_matches,
             "Targets Tested": len(limited_targets)
         })
-        print(f"Brute Force completed: {elapsed:.2f}ms, {brute_force_matches} matches")
+        print(f"Brute Force completed: {elapsed:.3f}s, {brute_force_matches} matches")
     
     except Exception as e:
         print(f"Brute Force method failed: {e}")
         tracemalloc.stop() if tracemalloc.is_tracing() else None
         results.append({
             "Method": "Brute Force", 
-            "Time (ms)": float('inf'), 
+            "Time (s)": float('inf'), 
+            "Time (ms)": float('inf'),
+            "Time Display": "Error",
             "Memory (KB)": 0, 
             "Matches": 0,
             "Targets Tested": 0
@@ -128,24 +143,29 @@ def benchmark_methods(transactions_df, targets_df):
                 print(f"DP error for target {i}: {e}")
                 continue
         
-        elapsed = (time.time() - start) * 1000
+        elapsed = time.time() - start
+        elapsed_ms = elapsed * 1000  # Convert to milliseconds for graphs
         _, peak = tracemalloc.get_traced_memory()
         tracemalloc.stop()
         results.append({
             "Method": "Dynamic Programming", 
-            "Time (ms)": round(elapsed, 2), 
+            "Time (s)": round(elapsed, 3),  # Time in seconds for table
+            "Time (ms)": round(elapsed_ms, 2),  # Time in milliseconds for graphs
+            "Time Display": format_time(elapsed),  # Formatted time for display
             "Memory (KB)": round(peak / 1024, 2), 
             "Matches": dp_matches,
             "Targets Tested": len(target_amounts)
         })
-        print(f"Dynamic Programming completed: {elapsed:.2f}ms, {dp_matches} matches")
+        print(f"Dynamic Programming completed: {elapsed:.3f}s, {dp_matches} matches")
     
     except Exception as e:
         print(f"Dynamic Programming method failed: {e}")
         tracemalloc.stop() if tracemalloc.is_tracing() else None
         results.append({
             "Method": "Dynamic Programming", 
-            "Time (ms)": float('inf'), 
+            "Time (s)": float('inf'), 
+            "Time (ms)": float('inf'),
+            "Time Display": "Error",
             "Memory (KB)": 0, 
             "Matches": 0,
             "Targets Tested": 0
@@ -166,24 +186,29 @@ def benchmark_methods(transactions_df, targets_df):
         elif ga_results is not None:
             ga_matches = 1
         
-        elapsed = (time.time() - start) * 1000
+        elapsed = time.time() - start
+        elapsed_ms = elapsed * 1000  # Convert to milliseconds for graphs
         _, peak = tracemalloc.get_traced_memory()
         tracemalloc.stop()
         results.append({
             "Method": "Genetic Algorithm", 
-            "Time (ms)": round(elapsed, 2), 
+            "Time (s)": round(elapsed, 3),  # Time in seconds for table
+            "Time (ms)": round(elapsed_ms, 2),  # Time in milliseconds for graphs
+            "Time Display": format_time(elapsed),  # Formatted time for display
             "Memory (KB)": round(peak / 1024, 2), 
             "Matches": ga_matches,
             "Targets Tested": len(target_amounts)
         })
-        print(f"Genetic Algorithm completed: {elapsed:.2f}ms, {ga_matches} matches")
+        print(f"Genetic Algorithm completed: {elapsed:.3f}s, {ga_matches} matches")
     
     except Exception as e:
         print(f"Genetic Algorithm method failed: {e}")
         tracemalloc.stop() if tracemalloc.is_tracing() else None
         results.append({
             "Method": "Genetic Algorithm", 
-            "Time (ms)": float('inf'), 
+            "Time (s)": float('inf'), 
+            "Time (ms)": float('inf'),
+            "Time Display": "Error",
             "Memory (KB)": 0, 
             "Matches": 0,
             "Targets Tested": 0
@@ -193,13 +218,13 @@ def benchmark_methods(transactions_df, targets_df):
     df_results = pd.DataFrame(results)
     
     # Clean up infinite values for display
+    df_results['Time (s)'] = df_results['Time (s)'].replace(float('inf'), 'Error')
     df_results['Time (ms)'] = df_results['Time (ms)'].replace(float('inf'), 'Error')
     
     print("\nBenchmark Results:")
     print(df_results)
 
     return df_results
-
 
 
 # ---- Example usage ----
